@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# gh extension: gh switch — wraps `gh auth switch`, re-binds git to gh for the host,
+# and sets global user.name / user.email to the active account.
+set -euo pipefail
+
+if [[ "${1:-}" == "--help" ]]; then
+  exec gh auth switch --help
+fi
+
+resolve_hostname() {
+  local h="$1"
+  if [[ -n "$h" ]]; then
+    printf '%s' "$h"
+    return
+  fi
+  # After interactive `gh auth switch`, argv may omit --hostname; use active host.
+  gh auth status -a 2>/dev/null | head -n 1 | tr -d '\r'
+}
+
+hostname=""
+argv=("$@")
+i=0
+while [[ $i -lt ${#argv[@]} ]]; do
+  a="${argv[$i]}"
+  case "$a" in
+    -h|--hostname)
+      if [[ $((i + 1)) -lt ${#argv[@]} ]]; then
+        hostname="${argv[$((i + 1))]}"
+      fi
+      i=$((i + 2))
+      continue
+      ;;
+    --hostname=*)
+      hostname="${a#*=}"
+      ;;
+  esac
+  i=$((i + 1))
+done
+
+gh auth switch "$@"
+
+hostname="$(resolve_hostname "$hostname")"
+if [[ -z "$hostname" ]]; then
+  hostname="github.com"
+fi
+
+gh auth setup-git --hostname "$hostname"
+
+login="$(gh api user --hostname "$hostname" --jq .login)"
+name="$(gh api user --hostname "$hostname" --jq '.name // ""')"
+email="$(gh api user --hostname "$hostname" --jq '.email // ""')"
+id="$(gh api user --hostname "$hostname" --jq .id)"
+
+# /user/emails often 404s without "user" scope; only trust output when gh exits 0 (ignore stdout on failure).
+if [[ -z "$email" || "$email" == "null" ]]; then
+  email2=""
+  set +e
+  email2=$(gh api user/emails --hostname "$hostname" --jq '[.[] | select(.primary == true)][0].email // empty' 2>/dev/null)
+  emails_status=$?
+  set -e
+  if [[ $emails_status -eq 0 && -n "$email2" && "$email2" != "null" ]]; then
+    email="$email2"
+  fi
+fi
+
+if [[ -z "$email" || "$email" == "null" || "$email" == *'"message"'* || "$email" == *'{"'* ]]; then
+  email="${id}+${login}@users.noreply.github.com"
+fi
+
+display_name="$name"
+if [[ -z "$display_name" || "$display_name" == "null" ]]; then
+  display_name="$login"
+fi
+
+git config --global user.name "$display_name"
+git config --global user.email "$email"
+
+printf 'Updated global git identity to %s <%s> (host %s)\n' "$display_name" "$email" "$hostname"
